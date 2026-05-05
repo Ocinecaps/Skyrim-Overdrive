@@ -52,6 +52,7 @@ std::atomic<uint64_t> g_total{0};
 std::atomic<uint64_t> g_batched{0};
 std::atomic<uint64_t> g_drains{0};
 std::atomic<uint64_t> g_passthrough{0};
+std::atomic<bool>     g_enabled{false};   // hooks inert until SetEnabled(true)
 
 bool g_installed = false;
 std::chrono::steady_clock::time_point g_lastLog;
@@ -80,6 +81,7 @@ inline DWORD GetOrLatchRenderTid(DWORD tid) {
 }
 
 inline bool ShouldBatch(DWORD tid) {
+    if (!g_enabled.load(std::memory_order_relaxed)) return false;
     return tid == GetOrLatchRenderTid(tid);
 }
 
@@ -156,12 +158,23 @@ bool Install() {
 
 void Shutdown() {
     if (!g_installed) return;
+    SetEnabled(false);
     Drain();
     MH_DisableHook(reinterpret_cast<LPVOID>(kVA_CB7E80));
     MH_DisableHook(reinterpret_cast<LPVOID>(kVA_CA2610));
     MH_RemoveHook (reinterpret_cast<LPVOID>(kVA_CB7E80));
     MH_RemoveHook (reinterpret_cast<LPVOID>(kVA_CA2610));
     g_installed = false;
+}
+
+void SetEnabled(bool enabled) {
+    bool prev = g_enabled.exchange(enabled, std::memory_order_release);
+    if (prev != enabled) {
+        OD_LOG("[Burst] %s. Hooks were %s; now %s.",
+               enabled ? "ENABLED" : "DISABLED",
+               prev ? "active" : "passthrough",
+               enabled ? "batching" : "passthrough");
+    }
 }
 
 void MaybeLogStats() {

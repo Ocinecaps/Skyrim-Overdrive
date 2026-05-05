@@ -43,4 +43,10 @@ bool Install();
 void Shutdown();
 void MaybeLogStats();
 
+// Until SetEnabled(true), every hooked call passthroughs to the original
+// without batching. This keeps the hooks installed-but-inert until the
+// pool is confirmed dispatchable (e.g., scaling test passed). Avoids
+// blocking on ParallelFor before workers are running.
+void SetEnabled(bool enabled);
+
 }

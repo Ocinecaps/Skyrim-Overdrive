@@ -103,12 +103,36 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
            GetCurrentThreadId());
     Sleep(50);
 
+    // Off the loader lock — these were installing in DllMain previously and
+    // CrashDebugger's 875ms of disk IO (reading the IDA symbol-extraction
+    // tree) was deadlocking the loader chain on some configurations. Move
+    // them here so DllMain returns immediately and Skyrim's loader is free.
+
+    // CrashDebugger first — so anything that crashes during the rest of init
+    // gets captured.
+    if (!overdrive::crashdbg::Install()) {
+        OD_LOG("[BOOT] CrashDebugger install failed (no forensic trace on crash)");
+    }
+
+    // BurstBatch hooks. Pool was captured in DllMain, but workers may not
+    // be alive yet — burst stays passthrough until the scaling test (below)
+    // confirms the pool can dispatch work. See burst::SetEnabled() call
+    // after self-test passes.
+    if (!overdrive::burst::Install()) {
+        OD_LOG("[BOOT] BurstBatch install failed");
+    }
+
     // Quiet mode — suppress the renderpool's 5-second periodic log line.
     // Self-test + scaling-test still log once each (they're one-shot).
     overdrive::renderpool::SetQuietMode(true);
 
     OD_LOG("[BOOT] slim worker entered pump loop. Periodic stats suppressed; "
-           "self-test + scaling-test will log once each, then silence.");
+           "self-test + scaling-test will log once each, then silence. "
+           "BurstBatch hooks are passthrough until 30s in (after self-test + "
+           "scaling-test pass and gameplay is warmed up).");
+
+    const auto workerStart = std::chrono::steady_clock::now();
+    bool burstEnabled = false;
 
     while (!gShouldExit.load(std::memory_order_relaxed)) {
         overdrive::renderpool::MaybeLogStats();
@@ -118,6 +142,22 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
         overdrive::d3dx::MaybeLogCallerHistograms();
         // Burst-batched ParallelFor stats (K=2 diagnostic re-run).
         overdrive::burst::MaybeLogStats();
+
+        // Enable burst batching after a 30-second warmup. By then:
+        //  - Self-test has run (proves the pool can dispatch tasks)
+        //  - Scaling test has run (proves workers are on different cores)
+        //  - The render thread TID has latched (D3DX has been hit)
+        //  - The game is past the loading screen, in actual gameplay.
+        if (!burstEnabled) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                now - workerStart).count();
+            if (elapsed >= 30) {
+                overdrive::burst::SetEnabled(true);
+                burstEnabled = true;
+            }
+        }
+
         Sleep(250);
     }
 
@@ -173,29 +213,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
                 OD_LOG("[BOOT] SlimEipSampler install failed");
             }
 
-            // Diagnostic for the burst-batch re-attempt. CrashDebugger
-            // installs an unhandled-exception filter that, on a fatal
-            // exception, captures EIP/ESP/registers + walks the stack
-            // symbolically (Windows DLLs via dbghelp PDBs, TESV.exe via
-            // IDA-extracted symbol table) into skyrim_overdrive_crash.log.
-            // Without this, a crash inside our hooked sub_CB7E80 leaves
-            // no forensic trace — just a vanished process. With it, we
-            // pinpoint exactly which instruction faulted and what state
-            // it was in, which tells us what shared state races.
-            if (!crashdbg::Install()) {
-                OD_LOG("[BOOT] CrashDebugger install failed (no forensic "
-                       "trace on crash)");
-            }
-
-            // Re-enable burst-batched ParallelFor over sub_CB7E80 +
-            // sub_CA2610 with K=2 — minimum possible concurrency. Two
-            // workers in flight at any moment instead of six. If the
-            // race is rate-dependent we may run clean and ratchet up.
-            // If we crash, CrashDebugger gives us the racy instruction.
-            // Either outcome is actionable.
-            if (!burst::Install()) {
-                OD_LOG("[BOOT] BurstBatch install failed");
-            }
+            // crashdbg::Install() and burst::Install() are deferred to the
+            // worker thread (off the loader lock). CrashDebugger reads ~900ms
+            // of IDA symbol files from disk; doing that under the loader
+            // lock can deadlock the DLL load chain. Both modules install
+            // safely from SlimWorkerProc immediately after the worker's
+            // 50ms sleep.
 
             // Spawn the worker thread that pumps the observer + tests.
             HANDLE th = CreateThread(nullptr, 0, SlimWorkerProc, nullptr, 0, nullptr);

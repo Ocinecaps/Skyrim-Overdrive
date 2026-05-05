@@ -6,6 +6,7 @@
 #include "D3D9PipelineDispatcher.h"
 
 #include <windows.h>
+#include <psapi.h>
 #include <d3d9.h>
 #include <cstring>
 #include <mutex>
@@ -343,33 +344,185 @@ bool TryGetLatestFrame(CapturedFrame& out, unsigned long long& inOutLastSeen) {
     return true;
 }
 
+// =============================================================================
+// Multi-module Direct3DCreate9 hook
+// =============================================================================
+// ENB's d3d9.dll proxy is what Skyrim resolves "d3d9" to. Hooking only that
+// module catches Skyrim's Direct3DCreate9 call (which lands in ENB), but ENB
+// internally calls the REAL d3d9.dll's Direct3DCreate9 — which we never see.
+// Result: the real IDirect3D9 / IDirect3DDevice9 vtables are never modified,
+// and every internal ENB read bypasses our Mirror shadow.
+//
+// Fix: walk all loaded modules, find every one whose filename is "d3d9.dll"
+// (case-insensitive), hook each one's Direct3DCreate9 export. Skyrim's call
+// to ENB-d3d9 fires our hook; ENB's call to real-d3d9 ALSO fires our hook.
+// Both paths funnel through HookedDirect3DCreate9 → both IDirect3D9 instances
+// (wrapper and real) get their CreateDevice vtable hooked → both eventual
+// devices get bulk-hooked + Mirror::Install'd.
+//
+// Up to 4 d3d9 modules tracked (ENB proxy + system32 real + ReShade + spare).
+// Each gets its own MinHook trampoline so the call chain is clean.
+
+namespace {
+
+constexpr int kMaxD3d9Modules = 4;
+
+struct D3D9HookSlot {
+    HMODULE             module    = nullptr;
+    char                path[260] = {};
+    LPVOID              target    = nullptr;
+    PFN_Direct3DCreate9 origTramp = nullptr;
+};
+
+D3D9HookSlot g_d3d9Slots[kMaxD3d9Modules];
+int          g_d3d9SlotCount = 0;
+
+// Per-slot trampoline: each goes to the same HookedDirect3DCreate9 logic.
+// We need a unique HookedXxx per slot because MinHook stores the original
+// trampoline per hook, and HookedDirect3DCreate9 must call back through
+// the matching trampoline so the chain reaches the next-lower module.
+// Generate them via macro.
+#define DEFINE_HOOKED_SLOT(N) \
+    IDirect3D9* WINAPI HookedDirect3DCreate9_Slot##N(UINT sdkVersion) {                     \
+        IDirect3D9* d3d = g_d3d9Slots[N].origTramp ? g_d3d9Slots[N].origTramp(sdkVersion) : nullptr; \
+        const auto count = gDirect3DCreate9Count.fetch_add(1, std::memory_order_relaxed) + 1; \
+        OD_LOG("[D3D9] Direct3DCreate9 #%llu via slot[%d]=%s (sdk=%u) -> %p",                \
+               count, N, g_d3d9Slots[N].path, sdkVersion, d3d);                              \
+        if (d3d && g_origCreateDevice == nullptr) {                                          \
+            if (VtableHook(d3d, kVtbl_IDirect3D9_CreateDevice,                               \
+                           reinterpret_cast<void*>(HookedCreateDevice),                      \
+                           reinterpret_cast<void**>(&g_origCreateDevice))) {                 \
+                OD_LOG("[D3D9] IDirect3D9::CreateDevice hooked (slot %d, orig=%p)",          \
+                       N, g_origCreateDevice);                                               \
+            }                                                                                \
+        }                                                                                    \
+        return d3d;                                                                          \
+    }
+DEFINE_HOOKED_SLOT(0)
+DEFINE_HOOKED_SLOT(1)
+DEFINE_HOOKED_SLOT(2)
+DEFINE_HOOKED_SLOT(3)
+#undef DEFINE_HOOKED_SLOT
+
+LPVOID g_slotHookFns[kMaxD3d9Modules] = {
+    reinterpret_cast<LPVOID>(HookedDirect3DCreate9_Slot0),
+    reinterpret_cast<LPVOID>(HookedDirect3DCreate9_Slot1),
+    reinterpret_cast<LPVOID>(HookedDirect3DCreate9_Slot2),
+    reinterpret_cast<LPVOID>(HookedDirect3DCreate9_Slot3),
+};
+
+bool IsD3d9Module(const char* basename) {
+    return _stricmp(basename, "d3d9.dll") == 0;
+}
+
+void EnumerateD3d9Modules() {
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    HANDLE proc = GetCurrentProcess();
+    if (!EnumProcessModules(proc, mods, sizeof(mods), &needed)) {
+        OD_LOG("[D3D9] EnumProcessModules failed: %lu", GetLastError());
+        return;
+    }
+    const int n = (int)(needed / sizeof(HMODULE));
+    int found = 0;
+    for (int i = 0; i < n && g_d3d9SlotCount < kMaxD3d9Modules; ++i) {
+        char path[MAX_PATH] = {};
+        if (!GetModuleFileNameExA(proc, mods[i], path, MAX_PATH)) continue;
+        const char* slash = strrchr(path, '\\');
+        const char* basename = slash ? slash + 1 : path;
+        if (!IsD3d9Module(basename)) continue;
+
+        // De-dupe by module handle (in case enumeration returns dupes).
+        bool dup = false;
+        for (int j = 0; j < g_d3d9SlotCount; ++j) {
+            if (g_d3d9Slots[j].module == mods[i]) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        D3D9HookSlot& slot = g_d3d9Slots[g_d3d9SlotCount];
+        slot.module = mods[i];
+        strncpy_s(slot.path, path, _TRUNCATE);
+        OD_LOG("[D3D9] discovered d3d9 module slot[%d]: %s (base=%p)",
+               g_d3d9SlotCount, path, mods[i]);
+        ++g_d3d9SlotCount;
+        ++found;
+    }
+    OD_LOG("[D3D9] EnumerateD3d9Modules: %d d3d9 module(s) loaded at install time", found);
+}
+
+}  // namespace
+
 bool Install() {
     if (MH_Initialize() != MH_OK) {
         OD_LOG("[D3D9] Install: MH_Initialize failed");
         return false;
     }
 
-    LPVOID target = nullptr;
-    MH_STATUS s = MH_CreateHookApiEx(
-        L"d3d9", "Direct3DCreate9",
-        reinterpret_cast<LPVOID>(HookedDirect3DCreate9),
-        reinterpret_cast<LPVOID*>(&g_origDirect3DCreate9),
-        &target);
-    if (s != MH_OK) {
-        OD_LOG("[D3D9] Install: MH_CreateHookApiEx(d3d9!Direct3DCreate9) failed: %s",
-               MH_StatusToString(s));
-        return false;
-    }
-    OD_LOG("[D3D9] Created hook on d3d9!Direct3DCreate9 (target=%p, orig trampoline=%p)",
-           target, g_origDirect3DCreate9);
+    EnumerateD3d9Modules();
 
-    s = MH_EnableHook(target);
-    if (s != MH_OK) {
-        OD_LOG("[D3D9] Install: MH_EnableHook failed: %s", MH_StatusToString(s));
-        return false;
+    // If no d3d9 modules are loaded yet, fall back to the original
+    // module-name lookup which will resolve once d3d9 is loaded by
+    // delay-load on Skyrim's first Direct3DCreate9 call.
+    int hooked = 0;
+    if (g_d3d9SlotCount == 0) {
+        OD_LOG("[D3D9] No d3d9 modules loaded yet; falling back to module-name resolution");
+        LPVOID target = nullptr;
+        MH_STATUS s = MH_CreateHookApiEx(
+            L"d3d9", "Direct3DCreate9",
+            reinterpret_cast<LPVOID>(HookedDirect3DCreate9_Slot0),
+            reinterpret_cast<LPVOID*>(&g_d3d9Slots[0].origTramp),
+            &target);
+        if (s == MH_OK) {
+            g_d3d9Slots[0].target = target;
+            g_d3d9SlotCount = 1;
+            if (MH_EnableHook(target) == MH_OK) {
+                ++hooked;
+                OD_LOG("[D3D9] Fallback hook installed (slot 0, target=%p)", target);
+            }
+        } else {
+            OD_LOG("[D3D9] Fallback MH_CreateHookApiEx failed: %s",
+                   MH_StatusToString(s));
+            return false;
+        }
+    } else {
+        // Hook each enumerated module's Direct3DCreate9 export.
+        for (int i = 0; i < g_d3d9SlotCount; ++i) {
+            FARPROC ep = GetProcAddress(g_d3d9Slots[i].module, "Direct3DCreate9");
+            if (!ep) {
+                OD_LOG("[D3D9] slot[%d] %s has no Direct3DCreate9 export — skipping",
+                       i, g_d3d9Slots[i].path);
+                continue;
+            }
+            MH_STATUS s = MH_CreateHook(reinterpret_cast<LPVOID>(ep),
+                                        g_slotHookFns[i],
+                                        reinterpret_cast<LPVOID*>(&g_d3d9Slots[i].origTramp));
+            if (s != MH_OK) {
+                OD_LOG("[D3D9] slot[%d] %s MH_CreateHook failed: %s",
+                       i, g_d3d9Slots[i].path, MH_StatusToString(s));
+                continue;
+            }
+            g_d3d9Slots[i].target = reinterpret_cast<LPVOID>(ep);
+            if (MH_EnableHook(reinterpret_cast<LPVOID>(ep)) != MH_OK) {
+                OD_LOG("[D3D9] slot[%d] MH_EnableHook failed", i);
+                continue;
+            }
+            ++hooked;
+            OD_LOG("[D3D9] slot[%d] %s hooked at %p (orig tramp=%p)",
+                   i, g_d3d9Slots[i].path, ep, g_d3d9Slots[i].origTramp);
+        }
     }
-    OD_LOG("[D3D9] Install OK: Direct3DCreate9 inline-hooked.");
-    return true;
+
+    // Keep the legacy single-export name for existing callers in this
+    // file (g_origDirect3DCreate9 is referenced for stats/printf only;
+    // not used as a function pointer anymore — slot trampolines are).
+    g_origDirect3DCreate9 = g_d3d9Slots[0].origTramp;
+
+    OD_LOG("[D3D9] Install OK: %d/%d d3d9 module(s) hooked. ENB proxy + real "
+           "system32 d3d9 should both funnel through our HookedDirect3DCreate9 "
+           "now, so ENB's internal reads on the real device will hit Mirror's "
+           "shadow.",
+           hooked, g_d3d9SlotCount);
+    return hooked > 0;
 }
 
 }  // namespace overdrive::d3d9hook

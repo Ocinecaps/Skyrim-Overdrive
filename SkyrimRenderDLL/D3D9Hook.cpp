@@ -517,12 +517,72 @@ bool Install() {
     // not used as a function pointer anymore — slot trampolines are).
     g_origDirect3DCreate9 = g_d3d9Slots[0].origTramp;
 
-    OD_LOG("[D3D9] Install OK: %d/%d d3d9 module(s) hooked. ENB proxy + real "
-           "system32 d3d9 should both funnel through our HookedDirect3DCreate9 "
-           "now, so ENB's internal reads on the real device will hit Mirror's "
-           "shadow.",
+    OD_LOG("[D3D9] Install OK: %d/%d d3d9 module(s) hooked at install time. "
+           "ENB lazily loads real system32 d3d9 LATER, so call "
+           "RescanAndHookNewD3d9Modules() periodically from the worker "
+           "thread to pick that up when it appears.",
            hooked, g_d3d9SlotCount);
     return hooked > 0;
+}
+
+int RescanAndHookNewD3d9Modules() {
+    HMODULE mods[1024] = {};
+    DWORD needed = 0;
+    HANDLE proc = GetCurrentProcess();
+    if (!EnumProcessModules(proc, mods, sizeof(mods), &needed)) return 0;
+    const int n = (int)(needed / sizeof(HMODULE));
+    int newlyHooked = 0;
+
+    for (int i = 0; i < n && g_d3d9SlotCount < kMaxD3d9Modules; ++i) {
+        char path[MAX_PATH] = {};
+        if (!GetModuleFileNameExA(proc, mods[i], path, MAX_PATH)) continue;
+        const char* slash = strrchr(path, '\\');
+        const char* basename = slash ? slash + 1 : path;
+        if (!IsD3d9Module(basename)) continue;
+
+        // Already in our slot table?
+        bool already = false;
+        for (int j = 0; j < g_d3d9SlotCount; ++j) {
+            if (g_d3d9Slots[j].module == mods[i]) { already = true; break; }
+        }
+        if (already) continue;
+
+        const int slotIdx = g_d3d9SlotCount;
+        D3D9HookSlot& slot = g_d3d9Slots[slotIdx];
+        slot.module = mods[i];
+        strncpy_s(slot.path, path, _TRUNCATE);
+
+        FARPROC ep = GetProcAddress(slot.module, "Direct3DCreate9");
+        if (!ep) {
+            OD_LOG("[D3D9] rescan: slot[%d] %s has no Direct3DCreate9 export — skipping",
+                   slotIdx, path);
+            ++g_d3d9SlotCount;  // record the slot so we don't re-process the same module
+            continue;
+        }
+        MH_STATUS s = MH_CreateHook(reinterpret_cast<LPVOID>(ep),
+                                    g_slotHookFns[slotIdx],
+                                    reinterpret_cast<LPVOID*>(&slot.origTramp));
+        if (s != MH_OK) {
+            OD_LOG("[D3D9] rescan: slot[%d] %s MH_CreateHook failed: %s",
+                   slotIdx, path, MH_StatusToString(s));
+            ++g_d3d9SlotCount;
+            continue;
+        }
+        slot.target = reinterpret_cast<LPVOID>(ep);
+        if (MH_EnableHook(reinterpret_cast<LPVOID>(ep)) != MH_OK) {
+            OD_LOG("[D3D9] rescan: slot[%d] MH_EnableHook failed", slotIdx);
+            ++g_d3d9SlotCount;
+            continue;
+        }
+        ++g_d3d9SlotCount;
+        ++newlyHooked;
+        OD_LOG("[D3D9] rescan: NEW slot[%d] %s hooked at %p (orig tramp=%p) — "
+               "this is likely real-d3d9 that ENB lazy-loaded after our "
+               "DllMain enumerated. ENB's calls on the real device will "
+               "now funnel through our hook chain.",
+               slotIdx, path, ep, slot.origTramp);
+    }
+    return newlyHooked;
 }
 
 }  // namespace overdrive::d3d9hook

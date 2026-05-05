@@ -55,4 +55,12 @@ struct CapturedFrame {
 // holds an internal slot lock for the duration of the copy.
 bool TryGetLatestFrame(CapturedFrame& out, unsigned long long& inOutLastSeen);
 
+// Re-scan loaded modules and hook any d3d9.dll instances that weren't present
+// at Install() time. ENB lazily LoadLibrary's the real system32 d3d9.dll
+// AFTER our DllMain ran, so the install-time scan only sees ENB's proxy.
+// Call this periodically from the worker thread (e.g., every 5s for the first
+// 30s of the game) — it's idempotent (already-hooked modules are skipped).
+// Returns the number of NEW modules hooked on this call.
+int RescanAndHookNewD3d9Modules();
+
 }

@@ -16,9 +16,11 @@
 #include "D3D9PipelineDispatcher.h"
 #include "D3D9ReadProfiler.h"
 #include "RenderPoolPatch.h"
+#include "D3D9Hook.h"
 
 #include <windows.h>
 #include <dbghelp.h>
+#include <chrono>
 
 namespace overdrive {
 
@@ -142,7 +144,33 @@ void RunInstrumentationLoop() {
                "Hot-sub recording (Week-2 path) remains active.");
     }
 
+    // d3d9hook re-scan cadence: ENB lazily LoadLibrary's the real system32
+    // d3d9.dll AFTER our DllMain enumeration. Re-scan every 1s for the
+    // first 30s. After that, all relevant modules should be loaded.
+    using clock = std::chrono::steady_clock;
+    using namespace std::chrono;
+    auto workerStart = clock::now();
+    auto lastRescan  = clock::now() - seconds(2);
+    bool rescanDone  = false;
+
     while (!gShouldExit.load(std::memory_order_relaxed)) {
+        if (!rescanDone) {
+            auto now = clock::now();
+            auto sinceStart = duration_cast<seconds>(now - workerStart).count();
+            auto sinceLast  = duration_cast<seconds>(now - lastRescan).count();
+            if (sinceLast >= 1) {
+                lastRescan = now;
+                int n = overdrive::d3d9hook::RescanAndHookNewD3d9Modules();
+                if (n > 0) {
+                    OD_LOG("[D3D9] periodic rescan picked up %d new d3d9 module(s)", n);
+                }
+            }
+            if (sinceStart >= 30) {
+                rescanDone = true;
+                OD_LOG("[D3D9] rescan period (30s) complete — stopping module re-enumeration");
+            }
+        }
+
         nidx9::MaybeLogStats();
         d3dx::MaybeLogStats();
         d3dx::MaybeLogCallerHistograms();

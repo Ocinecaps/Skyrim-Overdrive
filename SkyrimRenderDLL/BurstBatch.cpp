@@ -17,11 +17,14 @@ namespace {
 // so we declare hooks as __fastcall and let the compiler match the ABI.
 typedef void (__thiscall *PFN_HotSub)(void* thisPtr, void* arg);
 
-// Burst size. 32 amortizes pool overhead well: at ~2400 calls/frame in a
-// dense scene that's ~75 bursts/frame, ~30µs each = 2.2ms total burst
-// overhead vs ~12ms baseline serial work — net savings ~10ms/frame on the
-// render thread for the work that gets parallelized.
-constexpr int kBatchK = 32;
+// Burst size. K=32 crashed the game on the first drain (2026-05-05) — true
+// concurrent execution of sub_CB7E80 raced on shared scratch state inside
+// the function. Reduced to K=2 for the diagnostic re-run: minimum possible
+// concurrency (only two workers in flight at any moment), so if the race
+// is rate-dependent it may run clean and let us ratchet up to find the
+// threshold. If it still crashes, CrashDebugger captures the racy
+// instruction's address and we know exactly where to fix.
+constexpr int kBatchK = 2;
 
 constexpr uintptr_t kVA_CB7E80 = 0x00CB7E80;
 constexpr uintptr_t kVA_CA2610 = 0x00CA2610;

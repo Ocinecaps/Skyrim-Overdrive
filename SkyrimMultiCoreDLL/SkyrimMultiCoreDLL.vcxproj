@@ -58,7 +58,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>user32.lib;shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;shlwapi.lib;dbghelp.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -86,7 +86,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>user32.lib;shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;shlwapi.lib;dbghelp.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -99,6 +99,8 @@
     <ClCompile Include="..\SkyrimRenderDLL\RenderPoolPatch.cpp" />
     <ClCompile Include="..\SkyrimRenderDLL\D3DXReplace.cpp" />
     <ClCompile Include="..\SkyrimRenderDLL\SlimEipSampler.cpp" />
+    <ClCompile Include="..\SkyrimRenderDLL\BurstBatch.cpp" />
+    <ClCompile Include="..\SkyrimRenderDLL\CrashDebugger.cpp" />
     <ClCompile Include="..\SkyrimRenderDLL\MinHook\buffer.c" />
     <ClCompile Include="..\SkyrimRenderDLL\MinHook\trampoline.c" />
     <ClCompile Include="..\SkyrimRenderDLL\MinHook\hook.c" />
@@ -110,6 +112,8 @@
     <ClInclude Include="..\SkyrimRenderDLL\RenderPoolPatch.h" />
     <ClInclude Include="..\SkyrimRenderDLL\D3DXReplace.h" />
     <ClInclude Include="..\SkyrimRenderDLL\SlimEipSampler.h" />
+    <ClInclude Include="..\SkyrimRenderDLL\BurstBatch.h" />
+    <ClInclude Include="..\SkyrimRenderDLL\CrashDebugger.h" />
     <ClInclude Include="..\SkyrimRenderDLL\MinHook\MinHook.h" />
     <ClInclude Include="..\SkyrimRenderDLL\MinHook\buffer.h" />
     <ClInclude Include="..\SkyrimRenderDLL\MinHook\trampoline.h" />

@@ -41,6 +41,8 @@
 #include "../SkyrimRenderDLL/RenderPoolPatch.h"
 #include "../SkyrimRenderDLL/D3DXReplace.h"
 #include "../SkyrimRenderDLL/SlimEipSampler.h"
+#include "../SkyrimRenderDLL/BurstBatch.h"
+#include "../SkyrimRenderDLL/CrashDebugger.h"
 
 #include <windows.h>
 #include <shlwapi.h>
@@ -114,9 +116,8 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
         // return address per D3DX function is the Skyrim function calling
         // it in a hot loop, which is the parallelization target.
         overdrive::d3dx::MaybeLogCallerHistograms();
-        // (Drawcall-side parallelization disabled — sub_CB7E80/CA2610 are
-        // not safe to run concurrently with themselves. Pool foundation
-        // remains alive and idle, ready for the idle-work pivot.)
+        // Burst-batched ParallelFor stats (K=2 diagnostic re-run).
+        overdrive::burst::MaybeLogStats();
         Sleep(250);
     }
 
@@ -164,22 +165,36 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
                        "speedup unavailable; multi-core foundation still works)");
             }
 
-            // Drawcall parallelization deferred. sub_CB7E80 + sub_CA2610
-            // are not concurrency-safe (proven 2026-05-05: K=32 burst
-            // crashed on first drain). Foundation stays alive — the pool
-            // is captured, the 4.85x scaling test passes, the workers
-            // are ready. Next phase feeds them with naturally-independent
-            // CPU work (AI, particles, pathfinding) instead of fighting
-            // the scenegraph code's serial-only assumptions.
-            //
-            // Step 1 toward that: a lightweight EIP sampler on the render
-            // thread. Page-bucketed heatmap every 30s → tells us where
-            // the render thread spends CPU during real gameplay (including
-            // camera-turn). Cross-reference top pages against IDA to pick
-            // the next parallelization target.
+            // Step 1 toward idle-work pivot: lightweight EIP sampler on
+            // the render thread. Page-bucketed heatmap every 30s → tells
+            // us where the render thread spends CPU during real gameplay
+            // (including camera-turn).
             if (!slimeip::Install()) {
-                OD_LOG("[BOOT] SlimEipSampler install failed (heatmap "
-                       "data unavailable; foundation still works)");
+                OD_LOG("[BOOT] SlimEipSampler install failed");
+            }
+
+            // Diagnostic for the burst-batch re-attempt. CrashDebugger
+            // installs an unhandled-exception filter that, on a fatal
+            // exception, captures EIP/ESP/registers + walks the stack
+            // symbolically (Windows DLLs via dbghelp PDBs, TESV.exe via
+            // IDA-extracted symbol table) into skyrim_overdrive_crash.log.
+            // Without this, a crash inside our hooked sub_CB7E80 leaves
+            // no forensic trace — just a vanished process. With it, we
+            // pinpoint exactly which instruction faulted and what state
+            // it was in, which tells us what shared state races.
+            if (!crashdbg::Install()) {
+                OD_LOG("[BOOT] CrashDebugger install failed (no forensic "
+                       "trace on crash)");
+            }
+
+            // Re-enable burst-batched ParallelFor over sub_CB7E80 +
+            // sub_CA2610 with K=2 — minimum possible concurrency. Two
+            // workers in flight at any moment instead of six. If the
+            // race is rate-dependent we may run clean and ratchet up.
+            // If we crash, CrashDebugger gives us the racy instruction.
+            // Either outcome is actionable.
+            if (!burst::Install()) {
+                OD_LOG("[BOOT] BurstBatch install failed");
             }
 
             // Spawn the worker thread that pumps the observer + tests.

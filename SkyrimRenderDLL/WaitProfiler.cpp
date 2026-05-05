@@ -1,5 +1,6 @@
 #include "WaitProfiler.h"
 #include "DebugLogger.h"
+#include "CrashDebugger.h"
 #include "MinHook/MinHook.h"
 
 #include <windows.h>
@@ -267,10 +268,17 @@ void DumpOne(const char* label, const WaitBucket* table,
             std::snprintf(msBuf, sizeof(msBuf), "%lu", (unsigned long)entries[i].lastDwMs);
             msStr = msBuf;
         }
-        OD_LOG("[WaitProf]   %s #%-2d  ret=0x%08X  cs_FF15=0x%08X  cs_FFDx=0x%08X  hits=%llu  %.2f%%  lastDwMs=%s  inf=%llu",
+        // Resolve TESV.exe symbol via CrashDebugger's IDA-extracted table.
+        char symbuf[160] = "";
+        unsigned long off = 0;
+        const char* sym = overdrive::crashdbg::ResolveTesvAddr(ret, &off);
+        if (sym && sym[0] && sym[0] != '?') {
+            std::snprintf(symbuf, sizeof(symbuf), " %s+0x%lX", sym, off);
+        }
+        OD_LOG("[WaitProf]   %s #%-2d  ret=0x%08X  cs_FF15=0x%08X  cs_FFDx=0x%08X  hits=%llu  %.2f%%  lastDwMs=%s  inf=%llu%s",
                label, i + 1, ret, ret - 6, ret - 2,
                (unsigned long long)entries[i].hits, pct, msStr,
-               (unsigned long long)entries[i].infiniteHits);
+               (unsigned long long)entries[i].infiniteHits, symbuf);
     }
 }
 

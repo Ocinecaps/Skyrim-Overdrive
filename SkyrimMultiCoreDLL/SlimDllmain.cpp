@@ -43,6 +43,7 @@
 #include "../SkyrimRenderDLL/SlimEipSampler.h"
 #include "../SkyrimRenderDLL/BurstBatch.h"
 #include "../SkyrimRenderDLL/CrashDebugger.h"
+#include "../SkyrimRenderDLL/WaitProfiler.h"
 
 #include <windows.h>
 #include <shlwapi.h>
@@ -109,17 +110,27 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
     // them here so DllMain returns immediately and Skyrim's loader is free.
 
     // CrashDebugger first — so anything that crashes during the rest of init
-    // gets captured.
+    // gets captured. Builds the IDA symbol table (~875ms) which subsequent
+    // profilers use to resolve TESV.exe addresses to function names.
     if (!overdrive::crashdbg::Install()) {
         OD_LOG("[BOOT] CrashDebugger install failed (no forensic trace on crash)");
     }
 
     // BurstBatch hooks. Pool was captured in DllMain, but workers may not
-    // be alive yet — burst stays passthrough until the scaling test (below)
-    // confirms the pool can dispatch work. See burst::SetEnabled() call
-    // after self-test passes.
+    // be alive yet — burst stays passthrough (never enabled in this build).
     if (!overdrive::burst::Install()) {
         OD_LOG("[BOOT] BurstBatch install failed");
+    }
+
+    // WaitProfiler: hooks WaitForSingleObject/Ex/MultipleObjects, captures
+    // TESV.exe-internal callers. With CrashDebugger's symbol table now
+    // built, every dump line will name the responsible function. The
+    // pool's own worker waits will dominate (sub_A5AE90 et al.) but
+    // anything else with high `inf=` count and a TESV symbol that's NOT
+    // in the pool is a candidate for parallelization (or for replacement
+    // with a non-blocking variant).
+    if (!overdrive::waitprof::Install()) {
+        OD_LOG("[BOOT] WaitProfiler install failed");
     }
 
     // Quiet mode — suppress the renderpool's 5-second periodic log line.
@@ -142,6 +153,8 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
         // Burst-batched ParallelFor stats (passthrough mode reports
         // total + passthrough only; batched/drains stay 0).
         overdrive::burst::MaybeLogStats();
+        // Wait-call-site histogram. Logged every 15s.
+        overdrive::waitprof::MaybeLogStats();
 
         // burst::SetEnabled(true) intentionally NOT called.
         //

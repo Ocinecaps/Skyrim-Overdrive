@@ -2,6 +2,7 @@
 #include "D3DXReplace.h"
 #include "DebugLogger.h"
 #include "Globals.h"
+#include "CrashDebugger.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -199,17 +200,34 @@ void Dump() {
         const uint64_t hits   = best[i].hits;
         const uint32_t eip    = best[i].lastEip;
         const double   pct    = (100.0 * (double)hits) / (double)total;
-        // Tag the location: TESV.exe code, or external module (kernel32,
-        // d3d9, ENB, etc.). We don't resolve symbols in the slim build —
-        // user cross-references against IDA.
-        const char* loc;
+
         if (pageVa >= g_tesvLo && pageVa < g_tesvHi) {
-            loc = "TESV";
+            // Resolve to nearest known TESV function via CrashDebugger's
+            // IDA symbol table. Falls back to hex if not found.
+            unsigned long off = 0;
+            const char* sym = overdrive::crashdbg::ResolveTesvAddr(eip, &off);
+            if (sym && sym[0] && sym[0] != '?') {
+                OD_LOG("[SlimEIP]   #%-2d  TESV  hits=%llu  %.2f%%  eip=0x%08X  %s+0x%lX",
+                       i + 1, (unsigned long long)hits, pct, eip, sym, off);
+            } else {
+                OD_LOG("[SlimEIP]   #%-2d  TESV  hits=%llu  %.2f%%  eip=0x%08X  page=0x%08X (no symbol)",
+                       i + 1, (unsigned long long)hits, pct, eip, pageVa);
+            }
         } else {
-            loc = "ext"; // external module (driver / kernel32 / ENB / ...)
+            // External module (driver / kernel32 / ntdll / d3d9 / ENB / ...).
+            // We don't have symbols for these in the slim build, but a simple
+            // address-range lookup tells us which module.
+            const char* mod = "ext";
+            // Common Windows-loaded modules — address ranges we've seen in
+            // logs. Approximate; extends as we observe more.
+            if (pageVa >= 0x77400000u && pageVa < 0x77800000u) mod = "ntdll";
+            else if (pageVa >= 0x75400000u && pageVa < 0x75500000u) mod = "kernel32";
+            else if (pageVa >= 0x6F400000u && pageVa < 0x6FC00000u) mod = "d3d9/d3dx";
+            else if (pageVa >= 0x6D400000u && pageVa < 0x6D800000u) mod = "amdvk/driver";
+            else if (pageVa >= 0x67D00000u && pageVa < 0x67E00000u) mod = "amdvk/driver";
+            OD_LOG("[SlimEIP]   #%-2d  %-12s  hits=%llu  %.2f%%  eip=0x%08X",
+                   i + 1, mod, (unsigned long long)hits, pct, eip);
         }
-        OD_LOG("[SlimEIP]   #%-2d  page=0x%08X (%s)  hits=%llu  %.2f%%  eip=0x%08X",
-               i + 1, pageVa, loc, (unsigned long long)hits, pct, eip);
     }
 }
 

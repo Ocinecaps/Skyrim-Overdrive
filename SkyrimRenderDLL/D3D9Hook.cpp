@@ -726,34 +726,100 @@ static void TryHookEmbeddedRealDevice(IDirect3DDevice9* wrapped) {
     }
 
     const uint8_t* wbytes = reinterpret_cast<const uint8_t*>(wrapped);
+
+    // Hex dump of the first 0x40 bytes so we can SEE the wrapper layout
+    // when the heuristic doesn't find anything. Each line: 4 dwords =
+    // 16 bytes. dword pattern: usually [vtable, real_device, ...] for
+    // a simple inheritance-based wrapper, but ENB has more state.
+    OD_LOG("[D3D9] wrapper %p first 0x40 bytes (read-only dump):", wrapped);
+    for (int row = 0; row < 4; ++row) {
+        const int off = row * 16;
+        MEMORY_BASIC_INFORMATION rmbi = {};
+        if (!VirtualQuery(wbytes + off, &rmbi, sizeof(rmbi))) break;
+        if (rmbi.State != MEM_COMMIT) break;
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(wbytes + off);
+        OD_LOG("[D3D9]   +0x%02X: %08X %08X %08X %08X",
+               off, p[0], p[1], p[2], p[3]);
+    }
+
+    // Two-level scan. ENB may either:
+    //   (1) Store the real IDirect3DDevice9* directly in the wrapper at
+    //       some offset (single indirection: wrapper[+N] = real_device).
+    //   (2) Store a pointer to a state struct, which itself contains the
+    //       real device pointer (double indirection: wrapper[+N] =
+    //       state_struct, state_struct[+M] = real_device).
+    //
+    // We probe both. Range extended from 0x40 to 0x400 (1024 bytes)
+    // because ENB wrappers carry significant internal state.
+
+    constexpr int kScanMax = 0x400;
     int found = 0;
-    for (int off = sizeof(void*); off <= 0x40; off += sizeof(void*)) {
+    int directHits = 0;
+    int indirectHits = 0;
+
+    for (int off = sizeof(void*); off <= kScanMax; off += sizeof(void*)) {
         MEMORY_BASIC_INFORMATION wmbi = {};
         if (!VirtualQuery(wbytes + off, &wmbi, sizeof(wmbi))) break;
         if (wmbi.State != MEM_COMMIT) break;
 
         void* candidate = *reinterpret_cast<void* const*>(wbytes + off);
-        if (candidate == wrapped) continue;
-        if (!IsLikelyD3D9DevicePointer(candidate)) continue;
+        if (!candidate || candidate == wrapped) continue;
 
-        OD_LOG("[D3D9] TryHookEmbeddedRealDevice: candidate at wrapper offset "
-               "0x%02X is %p, vtable=%p — looks like a real D3D9 device. "
-               "Hooking its vtable.",
-               off, candidate, *reinterpret_cast<void* const*>(candidate));
+        // Direct: candidate IS the real device.
+        if (IsLikelyD3D9DevicePointer(candidate)) {
+            OD_LOG("[D3D9] TryHookEmbeddedRealDevice: DIRECT candidate at "
+                   "wrapper offset 0x%X is %p, vtable=%p — hooking.",
+                   off, candidate, *reinterpret_cast<void* const*>(candidate));
+            HookRealDeviceVtable(reinterpret_cast<IDirect3DDevice9*>(candidate));
+            ++found;
+            ++directHits;
+            continue;
+        }
 
-        HookRealDeviceVtable(reinterpret_cast<IDirect3DDevice9*>(candidate));
-        ++found;
+        // Indirect: candidate may be a state struct. Probe its first
+        // 0x40 bytes for a real-device pointer. We're conservative on
+        // depth here (one level) to avoid combinatorial blow-up on a
+        // large wrapper.
+        MEMORY_BASIC_INFORMATION cmbi = {};
+        if (!VirtualQuery(candidate, &cmbi, sizeof(cmbi))) continue;
+        if (cmbi.State != MEM_COMMIT) continue;
+        constexpr DWORD kReadable =
+            PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+            PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+        if (!(cmbi.Protect & kReadable) || (cmbi.Protect & PAGE_GUARD)) continue;
+
+        const uint8_t* cbytes = reinterpret_cast<const uint8_t*>(candidate);
+        for (int off2 = 0; off2 <= 0x40; off2 += sizeof(void*)) {
+            MEMORY_BASIC_INFORMATION c2mbi = {};
+            if (!VirtualQuery(cbytes + off2, &c2mbi, sizeof(c2mbi))) break;
+            if (c2mbi.State != MEM_COMMIT) break;
+
+            void* c2 = *reinterpret_cast<void* const*>(cbytes + off2);
+            if (!c2 || c2 == wrapped || c2 == candidate) continue;
+            if (!IsLikelyD3D9DevicePointer(c2)) continue;
+
+            OD_LOG("[D3D9] TryHookEmbeddedRealDevice: INDIRECT candidate at "
+                   "wrapper+0x%X→struct+0x%X is %p, vtable=%p — hooking.",
+                   off, off2, c2, *reinterpret_cast<void* const*>(c2));
+            HookRealDeviceVtable(reinterpret_cast<IDirect3DDevice9*>(c2));
+            ++found;
+            ++indirectHits;
+            break;  // one indirect hit per candidate is enough
+        }
     }
+
     if (found == 0) {
         OD_LOG("[D3D9] TryHookEmbeddedRealDevice: no plausible real-device "
-               "pointer found in wrapper %p first 0x40 bytes. ENB may store "
-               "the real device deeper in the wrapper struct, or at a "
-               "different offset than expected.",
-               wrapped);
+               "pointer found in wrapper %p across %d bytes (direct or "
+               "indirect). ENB may use a different storage strategy "
+               "(thread-local, getter method, hash map, etc.) or the "
+               "vtable check is too strict. See the hex dump above.",
+               wrapped, kScanMax);
     } else {
         OD_LOG("[D3D9] TryHookEmbeddedRealDevice: hooked %d real-device "
-               "candidate(s). ENB's internal direct reads should now land "
-               "on Mirror's shadow.", found);
+               "candidate(s) — direct=%d, indirect=%d. ENB's internal "
+               "direct reads should now land on Mirror's shadow.",
+               found, directHits, indirectHits);
     }
 }
 

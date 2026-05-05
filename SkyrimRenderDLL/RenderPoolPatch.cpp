@@ -321,6 +321,89 @@ void DoObserveTick() {
     if (filled > 0) g_observeNonEmpty.fetch_add(1, std::memory_order_relaxed);
 }
 
+// =============================================================================
+// Wake-pool — release workerSem so the master thread runs ResumeThread on workers
+// =============================================================================
+//
+// 2026-05-05 IDA finding: workers are spawned with dwCreationFlags=4
+// (CREATE_SUSPENDED) by the ctor at sub_A5B050. The master thread sub_A5AC30
+// runs:
+//   WaitForSingleObject(pool->workerSem [+0x8], INFINITE);
+//   for (i = 0; i < workerCount; ++i) ResumeThread(workerHandles[i]);
+//   ExitThread(0);
+//
+// Skyrim's own code never releases workerSem (no caller of sub_A5AD60 either).
+// The pool is vestigial: ctor builds the apparatus, but nothing wakes the
+// master. Workers stay suspended forever → masterSem never gets a worker
+// blocked on it → our ReleaseSemaphore(masterSem) just accumulates permits
+// no one consumes → tasks queue indefinitely with no execution.
+//
+// We release workerSem ourselves. Master wakes, ResumeThread's all 6 workers,
+// exits. Workers enter sub_A5B000 → sub_A59750 init → loop calling sub_A5AE90
+// (which is what consumes our masterSem permits and runs our tasks).
+//
+// Safety: Idempotent. If someone already released workerSem (master has
+// already run + exited), our ReleaseSemaphore puts a permit on a dead
+// semaphore — harmless leak. ResumeThread on already-resumed threads is also
+// safe (returns prev suspend count, no double-resume hazard since Windows
+// counts down the per-thread suspend count and won't go below 0).
+
+std::atomic<bool> g_poolWoken{false};
+
+void WakePoolIfDormant() {
+    if (g_poolWoken.exchange(true, std::memory_order_acq_rel)) return;
+
+    void* pool = g_pool.load(std::memory_order_acquire);
+    if (!pool) {
+        OD_LOG("[RenderPool] Wake: skipped — pool not captured yet");
+        g_poolWoken.store(false, std::memory_order_release);  // allow retry
+        return;
+    }
+
+    // Verify pool is post-init (vtable == off_110DD1C). If still pre-init,
+    // ctor hasn't finished — wait. WaitForSingleObject below is on the
+    // workerSem handle which the ctor sets up early, so technically we could
+    // race here, but better to be safe.
+    uint32_t vt = 0;
+    if (!SafeRead32(pool, &vt) || vt != kExpectedVtable_PostInit) {
+        OD_LOG("[RenderPool] Wake: skipped — pool vtable=0x%08X (not post-init 0x%08X yet)",
+               vt, (unsigned)kExpectedVtable_PostInit);
+        g_poolWoken.store(false, std::memory_order_release);  // allow retry
+        return;
+    }
+
+    HANDLE workerSem = nullptr;
+    if (!SafeRead32(reinterpret_cast<uint8_t*>(pool) + kOff_WorkerSem,
+                    reinterpret_cast<uint32_t*>(&workerSem)) || !workerSem) {
+        OD_LOG("[RenderPool] Wake: skipped — workerSem handle unreadable");
+        return;
+    }
+
+    // Probe: is the master thread STILL waiting (i.e., are workers still
+    // suspended)? We can tell indirectly by reading [+0x0C] — master decrements
+    // it after WaitForSingleObject succeeds. If [+0x0C] is still 1, master
+    // hasn't run yet. If 0, master has run and our wake is a no-op (still
+    // safe).
+    uint32_t taskCounter = 0;
+    SafeRead32(reinterpret_cast<uint8_t*>(pool) + kOff_TaskCounter, &taskCounter);
+
+    LONG prevCount = 0;
+    BOOL ok = ReleaseSemaphore(workerSem, 1, &prevCount);
+    if (!ok) {
+        DWORD err = GetLastError();
+        OD_LOG("[RenderPool] Wake: ReleaseSemaphore(workerSem=%p) failed err=%lu — "
+               "either bad handle or max-count exceeded (already permits in flight)",
+               workerSem, err);
+        return;
+    }
+
+    OD_LOG("[RenderPool] Wake: ReleaseSemaphore(workerSem=%p) OK prevCount=%ld "
+           "pool[+0x0C]=%u (1=master still waiting, 0=master already ran). "
+           "If master was waiting, all 6 CREATE_SUSPENDED workers are now resumed "
+           "and looping in sub_A5B000.",
+           workerSem, (long)prevCount, taskCounter);
+}
+
 std::atomic<bool> g_verifiedVtable{false};
 void MaybeVerifyPool() {
     if (g_verifiedVtable.load(std::memory_order_acquire)) return;
@@ -778,14 +861,27 @@ void MaybeLogStats() {
     DoObserveTick();
     MaybeVerifyPool();
 
-    // Phase 2 self-test: once we've observed at least one Skyrim task in the
-    // queue (proving the pool is fully running), submit our own no-op tasks
-    // and verify they get processed. This proves our enqueue protocol works
-    // before we depend on it for real workload patches in Phase 3.
+    // 2026-05-05: Skyrim never releases pool->workerSem (no caller of
+    // sub_A5AD60 in the entire IDA xref dump, and no observed task in 76s of
+    // gameplay). The pool is dormant — we wake it ourselves. WakePoolIfDormant
+    // is idempotent (set-once flag with retry-on-failure logic) and safe to
+    // call repeatedly.
+    if (g_pool.load(std::memory_order_acquire)) {
+        WakePoolIfDormant();
+    }
+
+    // Phase 2 self-test: previously gated on g_observeNonEmpty > 0 (i.e., wait
+    // until we observe Skyrim queue something). Dropped because Skyrim never
+    // queues anything — the gate would never open and the self-test would
+    // never run. Now triggers as soon as the pool is captured and at least
+    // 1 second has elapsed since install (give the ctor time to finish).
     if (!g_selfTestRan.load(std::memory_order_acquire) &&
-        g_pool.load(std::memory_order_acquire) &&
-        g_observeNonEmpty.load(std::memory_order_acquire) > 0) {
-        RunSelfTestOnce();
+        g_pool.load(std::memory_order_acquire)) {
+        auto sinceInstall = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_installTime).count();
+        if (sinceInstall >= 1000) {
+            RunSelfTestOnce();
+        }
     }
 
     // Scaling test — runs after the self-test passes. Measures real-world

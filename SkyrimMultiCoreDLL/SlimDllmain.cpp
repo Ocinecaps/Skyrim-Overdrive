@@ -128,11 +128,10 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
 
     OD_LOG("[BOOT] slim worker entered pump loop. Periodic stats suppressed; "
            "self-test + scaling-test will log once each, then silence. "
-           "BurstBatch hooks are passthrough until 30s in (after self-test + "
-           "scaling-test pass and gameplay is warmed up).");
-
-    const auto workerStart = std::chrono::steady_clock::now();
-    bool burstEnabled = false;
+           "BurstBatch hooks are PERMANENTLY passthrough in this build — "
+           "K=2+ corrupts state via the race at EIP=0x00CA1D70, K=1 collapses "
+           "frame time via per-call ParallelFor overhead. Re-enable only when "
+           "a TLS-shadowed replacement of the racy helper lands in .injsec.");
 
     while (!gShouldExit.load(std::memory_order_relaxed)) {
         overdrive::renderpool::MaybeLogStats();
@@ -140,23 +139,25 @@ static DWORD WINAPI SlimWorkerProc(LPVOID /*userData*/) {
         // return address per D3DX function is the Skyrim function calling
         // it in a hot loop, which is the parallelization target.
         overdrive::d3dx::MaybeLogCallerHistograms();
-        // Burst-batched ParallelFor stats (K=2 diagnostic re-run).
+        // Burst-batched ParallelFor stats (passthrough mode reports
+        // total + passthrough only; batched/drains stay 0).
         overdrive::burst::MaybeLogStats();
 
-        // Enable burst batching after a 30-second warmup. By then:
-        //  - Self-test has run (proves the pool can dispatch tasks)
-        //  - Scaling test has run (proves workers are on different cores)
-        //  - The render thread TID has latched (D3DX has been hit)
-        //  - The game is past the loading screen, in actual gameplay.
-        if (!burstEnabled) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                now - workerStart).count();
-            if (elapsed >= 30) {
-                overdrive::burst::SetEnabled(true);
-                burstEnabled = true;
-            }
-        }
+        // burst::SetEnabled(true) intentionally NOT called.
+        //
+        // K=1 race-rate=0% but per-call ParallelFor overhead crushes frame
+        // time (measured 35-40x MMT throughput collapse → slideshow).
+        // K>=2 race-rate=1.1%+ corrupts state, leads to D3D9 device drop +
+        // red screen within minutes.
+        //
+        // Both modes are unshippable. Until a TLS-shadowed replacement of
+        // the helper at EIP=0x00CA1D70 lands in our .injsec segment,
+        // burst stays passthrough and the slim DLL ships only the
+        // genuinely-helpful pieces:
+        //   - pool foundation (captured, idle, ready for future work)
+        //   - D3DX SSE replacements (small CPU win, no concurrency issue)
+        //   - SlimEipSampler (data-gathering for future targets)
+        //   - CrashDebugger (forensic safety net)
 
         Sleep(250);
     }

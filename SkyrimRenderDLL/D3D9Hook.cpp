@@ -22,6 +22,14 @@ std::atomic<unsigned int>       gBackBufferHeight{0};
 std::atomic<unsigned long>      gRenderThreadId{0};
 std::atomic<void*>              gRenderThreadHandle{nullptr};
 
+// ENB-bypass fix support — defined after the slot-globals anonymous
+// namespace at the bottom of the file. Forward-declared here so
+// HookedCreateDevice (in the upper anonymous namespace) can call them.
+// `static` gives internal linkage; visibility is via the implicit
+// using-directive that anonymous namespaces inject into the enclosing
+// scope.
+static void TryHookEmbeddedRealDevice(IDirect3DDevice9* wrapped);
+
 namespace {
 
 constexpr int kVtbl_IDirect3D9_CreateDevice         = 16;
@@ -309,6 +317,27 @@ HRESULT STDMETHODCALLTYPE HookedCreateDevice(IDirect3D9* d3d, UINT adapter,
                 OD_LOG("[D3D9] IDirect3DDevice9::Present vtable hook FAILED");
             }
         }
+
+        // ENB BYPASS FIX: probe the device we got back for an embedded
+        // pointer to a SECOND IDirect3DDevice9. ENB's wrapper class
+        // typically inherits IDirect3DDevice9 (so first member at +0 is
+        // its own vtable) and stores the underlying real device pointer
+        // at a low offset (+4..+0x40). When ENB internally needs to read
+        // device state during its post-process passes, it bypasses its
+        // own wrapper and calls methods directly on that saved real
+        // device pointer — those calls miss our hooks unless we ALSO
+        // modify the real device's vtable.
+        //
+        // Heuristic: walk *(void**)(*outDev + offset) for offset = 4..0x40,
+        // step 4. For each candidate pointer P that's:
+        //   1. non-null and points to readable committed memory
+        //   2. P[0] (its vtable) points into a known d3d9.dll module's
+        //      address range
+        //   3. P[0][0] (first vtable entry, IUnknown::QueryInterface) is
+        //      a code address in the same d3d9.dll module
+        // ...P is almost certainly a real IDirect3DDevice9. Apply the
+        // same bulk-hook + Mirror::Install + Present hook to it.
+        TryHookEmbeddedRealDevice(*outDev);
     }
     return hr;
 }
@@ -583,6 +612,142 @@ int RescanAndHookNewD3d9Modules() {
                slotIdx, path, ep, slot.origTramp);
     }
     return newlyHooked;
+}
+
+// =============================================================================
+// ENB-bypass fix: probe ENB's wrapped device for the embedded real
+// IDirect3DDevice9 pointer and hook its vtable directly.
+// =============================================================================
+// First test (commit 113fac8) confirmed ENB still bypasses: pipeline mode
+// caused triangle glitches with the multi-module hook in place. Conclusion:
+// ENB stores a saved pointer to the real device that was created BEFORE
+// our slot[1] hook landed (we hooked real-d3d9!Direct3DCreate9 at +1.7s
+// from DllMain via periodic rescan, but ENB had already called it at
+// +1.1s). The real device's vtable was not modified at construction time,
+// so ENB's internal Get/Set calls on that saved pointer don't hit Mirror.
+//
+// Heuristic: walk the wrapped device's first 64 bytes (16 dwords). For
+// each dword that points to readable committed memory whose first dword
+// (vtable pointer) lies inside a known d3d9.dll module's image AND whose
+// vtable[0] (QueryInterface) is also inside that module's executable
+// section — that's a real D3D9 IDirect3DDevice9. Apply the same bulk-hook
+// + Mirror::Install we apply to the wrapper.
+//
+// Static for internal linkage; visible from the upper anonymous namespace
+// via implicit using-directive of the lower anon ns (where g_d3d9Slots
+// lives) and explicit forward decl at the top of the file.
+
+namespace {
+
+bool InModule(void* addr, HMODULE mod) {
+    if (!mod) return false;
+    MODULEINFO mi = {};
+    if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) return false;
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+    const uintptr_t hi = lo + mi.SizeOfImage;
+    const uintptr_t a  = reinterpret_cast<uintptr_t>(addr);
+    return a >= lo && a < hi;
+}
+
+bool IsLikelyD3D9DevicePointer(void* candidate) {
+    if (!candidate) return false;
+
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(candidate, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    constexpr DWORD kReadable =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+        PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+    if (!(mbi.Protect & kReadable)) return false;
+    if (mbi.Protect & PAGE_GUARD)   return false;
+
+    void* vt = *reinterpret_cast<void**>(candidate);
+    if (!vt) return false;
+
+    bool vtInD3d9 = false;
+    for (int i = 0; i < g_d3d9SlotCount; ++i) {
+        if (InModule(vt, g_d3d9Slots[i].module)) { vtInD3d9 = true; break; }
+    }
+    if (!vtInD3d9) return false;
+
+    if (!VirtualQuery(vt, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT || !(mbi.Protect & kReadable)) return false;
+    void* fn0 = *reinterpret_cast<void**>(vt);
+    if (!fn0) return false;
+
+    for (int i = 0; i < g_d3d9SlotCount; ++i) {
+        if (InModule(fn0, g_d3d9Slots[i].module)) return true;
+    }
+    return false;
+}
+
+constexpr int kMaxRealDevices = 4;
+IDirect3DDevice9* g_hookedRealDevices[kMaxRealDevices] = {};
+int               g_hookedRealDeviceCount = 0;
+
+void HookRealDeviceVtable(IDirect3DDevice9* realDev) {
+    if (!realDev) return;
+    for (int i = 0; i < g_hookedRealDeviceCount; ++i) {
+        if (g_hookedRealDevices[i] == realDev) return;  // already hooked
+    }
+    if (g_hookedRealDeviceCount >= kMaxRealDevices) {
+        OD_LOG("[D3D9] real-device hook table full (%d) — skipping", kMaxRealDevices);
+        return;
+    }
+    g_hookedRealDevices[g_hookedRealDeviceCount++] = realDev;
+
+    OD_LOG("[D3D9] HookRealDeviceVtable: applying bulk-hook + Mirror::Install "
+           "to real IDirect3DDevice9 %p (vtable=%p)",
+           realDev, *reinterpret_cast<void**>(realDev));
+
+    d3d9vt::BulkHookDevice(realDev);
+    mirror::Install(realDev);
+    // Don't re-hook Present on the real device — Skyrim only calls Present
+    // through the wrapper, and ENB's present-time effects loop through its
+    // own present chain (not by calling our HookedPresent on the real device).
+}
+
+}  // namespace
+
+static void TryHookEmbeddedRealDevice(IDirect3DDevice9* wrapped) {
+    if (!wrapped) return;
+    if (g_d3d9SlotCount < 2) {
+        OD_LOG("[D3D9] TryHookEmbeddedRealDevice: skipping — only %d d3d9 "
+               "module(s) known. Real d3d9 hasn't been discovered yet.",
+               g_d3d9SlotCount);
+        return;
+    }
+
+    const uint8_t* wbytes = reinterpret_cast<const uint8_t*>(wrapped);
+    int found = 0;
+    for (int off = sizeof(void*); off <= 0x40; off += sizeof(void*)) {
+        MEMORY_BASIC_INFORMATION wmbi = {};
+        if (!VirtualQuery(wbytes + off, &wmbi, sizeof(wmbi))) break;
+        if (wmbi.State != MEM_COMMIT) break;
+
+        void* candidate = *reinterpret_cast<void* const*>(wbytes + off);
+        if (candidate == wrapped) continue;
+        if (!IsLikelyD3D9DevicePointer(candidate)) continue;
+
+        OD_LOG("[D3D9] TryHookEmbeddedRealDevice: candidate at wrapper offset "
+               "0x%02X is %p, vtable=%p — looks like a real D3D9 device. "
+               "Hooking its vtable.",
+               off, candidate, *reinterpret_cast<void* const*>(candidate));
+
+        HookRealDeviceVtable(reinterpret_cast<IDirect3DDevice9*>(candidate));
+        ++found;
+    }
+    if (found == 0) {
+        OD_LOG("[D3D9] TryHookEmbeddedRealDevice: no plausible real-device "
+               "pointer found in wrapper %p first 0x40 bytes. ENB may store "
+               "the real device deeper in the wrapper struct, or at a "
+               "different offset than expected.",
+               wrapped);
+    } else {
+        OD_LOG("[D3D9] TryHookEmbeddedRealDevice: hooked %d real-device "
+               "candidate(s). ENB's internal direct reads should now land "
+               "on Mirror's shadow.", found);
+    }
 }
 
 }  // namespace overdrive::d3d9hook

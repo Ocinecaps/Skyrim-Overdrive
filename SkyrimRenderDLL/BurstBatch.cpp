@@ -18,19 +18,23 @@ namespace {
 typedef void (__thiscall *PFN_HotSub)(void* thisPtr, void* arg);
 
 // Burst size. History (2026-05-05):
-//   K=32: crashed on first drain (true concurrency triggered the race).
-//   K=2:  crashed at burst-enable transition; CrashDebugger captured
-//         nothing (some upstream SEH absorbed it, or it manifested as a
-//         hang). Fixed in this build: __try/__except wraps the worker's
-//         call to sub_CB7E80, captures EXCEPTION_POINTERS into a snapshot
-//         struct, swallows the exception. Game continues; we get the
-//         crash address + registers in the next [Burst] log line.
-//   K=1:  conservative fallback (one worker at a time = vanilla concurrency).
+//   K=32: crashed on first drain (~100% race rate).
+//   K=2 (no SEH):     crashed at burst-enable; no log (upstream SEH
+//                     swallowed). Process died.
+//   K=2 with __except: 24 worker AVs / 2163 drains = 1.1% race rate.
+//                      Process survived but D3D9 device dropped due to
+//                      cumulative half-written constants → red screen.
+//                      Captured EIP=0x00CA1D70, ESI=dword_1BAE0A8+0x28.
+//                      Fault is inside a helper called from sub_CB7E80,
+//                      writing to the second D3D9 constants buffer.
+//   K=1:  no concurrency, no race, no perf. STABLE.
 //
-// Restored to K=2 because we now have inner-SEH instrumentation: K=2 will
-// expose the race AND log the racy instruction's address without killing
-// the process. That's the data needed to write the .injsec replacement.
-constexpr int kBatchK = 2;
+// Reverting to K=1 as the shipping default. The diagnostic data needed
+// for the fix has been captured; no benefit to keeping K=2 in the
+// shipped binary while the fix is being designed (it just makes the
+// game unplayable). Re-enable K>=2 only with a TLS-shadowed replacement
+// of the racy helper in our .injsec segment.
+constexpr int kBatchK = 1;
 
 constexpr uintptr_t kVA_CB7E80 = 0x00CB7E80;
 constexpr uintptr_t kVA_CA2610 = 0x00CA2610;

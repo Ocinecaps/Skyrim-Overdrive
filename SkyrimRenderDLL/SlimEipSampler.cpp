@@ -43,6 +43,21 @@ std::chrono::steady_clock::time_point g_lastDump;
 std::chrono::steady_clock::time_point g_renderTidLatchedAt;
 bool g_renderTidEverSeen = false;
 
+// Render-thread CPU% accounting. GetThreadTimes returns user+kernel CPU time
+// for the thread; comparing the delta over a wall-clock window tells us
+// whether the render thread is CPU-bound (close to 100%) or GPU-bound
+// (significantly less). This is THE question for whether parallelism can
+// help: a render thread that's 95% CPU-busy benefits massively from work
+// migration; one that's 30% busy waiting on the GPU sees nothing.
+ULARGE_INTEGER g_lastUser{};
+ULARGE_INTEGER g_lastKernel{};
+bool           g_haveLastSnap = false;
+
+inline ULARGE_INTEGER ToULI(const FILETIME& ft) {
+    ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    return u;
+}
+
 inline uint32_t MixPageId(uint32_t p) {
     p ^= p >> 16; p *= 0x7feb352d;
     p ^= p >> 15; p *= 0x846ca68b;
@@ -149,6 +164,31 @@ void Dump() {
             for (int j = copyEnd; j > pos; --j) best[j] = best[j-1];
             best[pos] = e;
             if (bestCount < kTopN) ++bestCount;
+        }
+    }
+
+    // Render-thread CPU% over the window. ~30s wall, GetThreadTimes returns
+    // 100ns ticks of CPU time consumed (user+kernel).
+    {
+        FILETIME crt, ext, kt, ut;
+        if (GetThreadTimes(g_targetHandle, &crt, &ext, &kt, &ut)) {
+            ULARGE_INTEGER u = ToULI(ut), k = ToULI(kt);
+            if (g_haveLastSnap) {
+                uint64_t cpuTicks = (u.QuadPart - g_lastUser.QuadPart)
+                                  + (k.QuadPart - g_lastKernel.QuadPart);
+                double cpuMs   = cpuTicks / 10000.0;          // 100ns → ms
+                double wallMs  = 30000.0;                     // dump cadence
+                double cpuPct  = 100.0 * cpuMs / wallMs;
+                if (cpuPct > 100.0) cpuPct = 100.0;
+                const char* verdict;
+                if (cpuPct >= 90.0)      verdict = "CPU-BOUND   (parallelism would help a lot)";
+                else if (cpuPct >= 70.0) verdict = "MIXED       (parallelism helps in spikes)";
+                else if (cpuPct >= 40.0) verdict = "PARTLY GPU  (some headroom for parallelism)";
+                else                     verdict = "GPU-BOUND   (parallelism won't help FPS — render thread is waiting)";
+                OD_LOG("[SlimEIP] render-thread CPU%%: %.1f%% over ~30s  (%.1f ms CPU / %.0f ms wall)  → %s",
+                       cpuPct, cpuMs, wallMs, verdict);
+            }
+            g_lastUser = u; g_lastKernel = k; g_haveLastSnap = true;
         }
     }
 

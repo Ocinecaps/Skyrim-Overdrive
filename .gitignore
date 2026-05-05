@@ -1,0 +1,44 @@
+# Build artifacts
+Debug/
+Release/
+x64/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.log
+
+# VS metadata
+.vs/
+*.vcxproj.user
+*.suo
+*.user
+*.sdf
+*.opensdf
+*.aps
+*.ncb
+*.cachefile
+*.VC.db
+*.VC.opendb
+
+# Per-project hidden state
+SkyrimMultiCoreDLL/SkyrimMu.E2A77B41/
+SkyrimRenderDLL/SkyrimRenderDLL/
+SkyrimMultiCoreDLL/Debug/
+SkyrimMultiCoreDLL/Release/
+SkyrimRenderDLL/Debug/
+SkyrimRenderDLL/Release/
+
+# Runtime artifacts (live in the Skyrim install dir, not here)
+*.dll
+*.exe
+!scripts/FindCallers.exe
+
+# Captured logs from real runs — kept out of source
+skyrim_overdrive*.log
+skyrim_multicore*.log

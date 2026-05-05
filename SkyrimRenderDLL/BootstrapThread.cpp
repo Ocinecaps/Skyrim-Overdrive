@@ -41,30 +41,31 @@ constexpr bool kInstrumentationOnlyMode = true;
 // (Week-2 path). Use this to bisect whether a behavior change came from the
 // pipeline architecture vs. the surrounding instrumentation.
 //
-// 2026-05-05: Re-disabled. Tested with ENB in chain (the user's required
-// configuration); pipeline causes visual glitches on textures (and likely
-// shadows / specific render-target consumers). Magic effects and most
-// geometry render correctly, but textures don't show or flicker.
+// 2026-05-05 (later same day): Re-enabled to test against the multi-module
+// D3D9 hook (commits d5dbcab + dbc5945). Both ENB's d3d9.dll proxy AND
+// real system32\d3d9.dll are now hooked at Direct3DCreate9, so ENB's
+// internal calls to real-d3d9!Direct3DCreate9 (and any subsequent
+// CreateDevice on the real IDirect3D9) funnel through our hook chain.
+// Our Mirror handlers register the get/set wrappers on the IDirect3DDevice9
+// vtable bulk-hook, so ENB reads via the wrapper chain land on our shadow.
 //
-// Root cause: ENB's d3d9.dll proxy reads device state when running its
-// post-pass effects. Our pipeline defers SetTexture/SetRenderTarget until
-// the dispatcher drains. Between Skyrim's Set on our hook and the
-// dispatcher's actual orig<>() call, ENB sees the OLD device state and
-// makes wrong decisions (binds wrong texture, samples wrong RT). Our RT/DS
-// shadows in Mirror_GetRenderTarget cover Skyrim's own reads but ENB
-// bypasses those — it goes straight to the real device.
+// History from earlier today (kept for context):
+//   - First disabled because pipeline caused texture glitches with ENB.
+//     Cause was ENB bypassing our wrapper's GET methods by reading the
+//     real device directly. The real device's vtable was not modified
+//     because our hook only saw ENB's d3d9.dll proxy, not the real one.
+//   - Multi-module hook fixes the install-time gap. Periodic rescan
+//     fixes the lazy-load gap (ENB loads real d3d9 AFTER our DllMain).
 //
-// Fix would require either dropping ENB compatibility (path the user
-// rejected) or building cross-thread state visibility for ENB to read from
-// (architecturally large; equivalent to building our own d3d9 wrapper).
-// Neither fits the 1-month scope. Pipeline approach is shelved.
-//
-// Multi-core path forward: identify SAFE TESV render-prep loops (matrix
-// transforms per object, visibility cull per cell, etc.) and patch them
-// onto Skyrim's existing 6-worker pool via RunParallel. That avoids the
-// D3D9 chain entirely — the multi-core work happens BEFORE the drawcalls,
-// not on them.
-constexpr bool kEnablePipeline = false;
+// If ENB still bypasses with the multi-module hook in place (i.e., it
+// holds a saved real-IDirect3DDevice9* and reads through it directly,
+// and that real device's vtable was set up before our rescan caught it),
+// we'll see textures flicker again and revert. Next step in that case
+// is wrapper introspection: probe ENB's IDirect3DDevice9 wrapper at
+// +4/+8/+0xC for a pointer into real-d3d9's range, hook that real
+// device's vtable too. For now, assume the multi-module hook is
+// sufficient and verify empirically.
+constexpr bool kEnablePipeline = true;
 
 namespace {
 

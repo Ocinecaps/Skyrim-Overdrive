@@ -487,6 +487,13 @@ bool Install() {
         return false;
     }
 
+    // Build stamp — verify the right binary is loaded. Bumped on every change
+    // to D3D9Hook so we can tell from the log whether the user picked up the
+    // latest DLL after a rebuild.
+    OD_LOG("[D3D9] Build: 2026-05-05-c1aef14+intro (multi-module hook + "
+           "periodic rescan + ENB-wrapper introspection for real-device "
+           "vtable hooking).");
+
     EnumerateD3d9Modules();
 
     // If no d3d9 modules are loaded yet, fall back to the original

@@ -102,7 +102,6 @@
     <ClCompile Include="..\SkyrimRenderDLL\BurstBatch.cpp" />
     <ClCompile Include="..\SkyrimRenderDLL\CrashDebugger.cpp" />
     <ClCompile Include="..\SkyrimRenderDLL\WaitProfiler.cpp" />
-    <ClCompile Include="..\SkyrimRenderDLL\TlsShadowBuffer.cpp" />
     <ClCompile Include="..\SkyrimRenderDLL\MinHook\buffer.c" />
     <ClCompile Include="..\SkyrimRenderDLL\MinHook\trampoline.c" />
     <ClCompile Include="..\SkyrimRenderDLL\MinHook\hook.c" />
@@ -117,7 +116,6 @@
     <ClInclude Include="..\SkyrimRenderDLL\BurstBatch.h" />
     <ClInclude Include="..\SkyrimRenderDLL\CrashDebugger.h" />
     <ClInclude Include="..\SkyrimRenderDLL\WaitProfiler.h" />
-    <ClInclude Include="..\SkyrimRenderDLL\TlsShadowBuffer.h" />
     <ClInclude Include="..\SkyrimRenderDLL\MinHook\MinHook.h" />
     <ClInclude Include="..\SkyrimRenderDLL\MinHook\buffer.h" />
     <ClInclude Include="..\SkyrimRenderDLL\MinHook\trampoline.h" />

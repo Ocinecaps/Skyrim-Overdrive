@@ -22,6 +22,11 @@ void MaybeLogStats();
 // ParallelFor to get multi-core CPU drawcall prep.
 void MaybeLogCallerHistograms();
 
+// Render thread TID, latched on first replacement call (since D3DX is hit
+// almost exclusively from the render thread). Other modules can read this
+// to decide which thread to profile / batch on. 0 until first call.
+extern std::atomic<uint32_t> gRenderThreadId;
+
 // Cumulative call counters per replaced function. Useful for verifying which
 // functions actually get hit, and for HUD/external display.
 extern std::atomic<uint32_t> gCount_MatrixMultiplyTranspose;

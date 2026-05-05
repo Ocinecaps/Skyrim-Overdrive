@@ -10,6 +10,8 @@
 
 namespace overdrive::d3dx {
 
+std::atomic<uint32_t> gRenderThreadId{0};
+
 std::atomic<uint32_t> gCount_MatrixMultiplyTranspose{0};
 std::atomic<uint32_t> gCount_MatrixMultiply{0};
 std::atomic<uint32_t> gCount_MatrixTranspose{0};
@@ -75,6 +77,11 @@ CallerEntry g_callers[CS_COUNT][kCallerBuckets] = {};
 volatile LONG g_callerDropped[CS_COUNT] = {};
 
 inline void NoteCaller(int set, DWORD retaddr) {
+    // Latch the render TID once. D3DX is called from the render thread
+    // essentially exclusively, so the first thread we see here is it.
+    if (gRenderThreadId.load(std::memory_order_relaxed) == 0) {
+        gRenderThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
     const LONG ra = (LONG)retaddr;
     auto* buckets = g_callers[set];
     for (size_t i = 0; i < kCallerBuckets; ++i) {

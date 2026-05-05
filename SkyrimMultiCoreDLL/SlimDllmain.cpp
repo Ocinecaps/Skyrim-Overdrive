@@ -40,6 +40,7 @@
 #include "../SkyrimRenderDLL/DebugLogger.h"
 #include "../SkyrimRenderDLL/RenderPoolPatch.h"
 #include "../SkyrimRenderDLL/D3DXReplace.h"
+#include "../SkyrimRenderDLL/SlimEipSampler.h"
 
 #include <windows.h>
 #include <shlwapi.h>
@@ -170,6 +171,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*lpReserved*/) {
             // are ready. Next phase feeds them with naturally-independent
             // CPU work (AI, particles, pathfinding) instead of fighting
             // the scenegraph code's serial-only assumptions.
+            //
+            // Step 1 toward that: a lightweight EIP sampler on the render
+            // thread. Page-bucketed heatmap every 30s → tells us where
+            // the render thread spends CPU during real gameplay (including
+            // camera-turn). Cross-reference top pages against IDA to pick
+            // the next parallelization target.
+            if (!slimeip::Install()) {
+                OD_LOG("[BOOT] SlimEipSampler install failed (heatmap "
+                       "data unavailable; foundation still works)");
+            }
 
             // Spawn the worker thread that pumps the observer + tests.
             HANDLE th = CreateThread(nullptr, 0, SlimWorkerProc, nullptr, 0, nullptr);

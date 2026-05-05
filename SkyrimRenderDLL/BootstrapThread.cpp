@@ -65,7 +65,7 @@ constexpr bool kInstrumentationOnlyMode = true;
 // +4/+8/+0xC for a pointer into real-d3d9's range, hook that real
 // device's vtable too. For now, assume the multi-module hook is
 // sufficient and verify empirically.
-constexpr bool kEnablePipeline = true;
+constexpr bool kEnablePipeline = false;
 
 namespace {
 

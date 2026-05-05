@@ -19,21 +19,18 @@ typedef void (__thiscall *PFN_HotSub)(void* thisPtr, void* arg);
 
 // Burst size. History (2026-05-05):
 //   K=32: crashed on first drain (true concurrency triggered the race).
-//   K=2:  crashed at the 30s burst-enable transition (race fires at any
-//         level of true concurrency on dword_1BAC080).
-//   K=1:  one worker active at a time; identical concurrency to vanilla,
-//         no race possible. ZERO perf gain (overhead exceeds work) but
-//         proves the dispatch path runs on workers without crashing.
+//   K=2:  crashed at burst-enable transition; CrashDebugger captured
+//         nothing (some upstream SEH absorbed it, or it manifested as a
+//         hang). Fixed in this build: __try/__except wraps the worker's
+//         call to sub_CB7E80, captures EXCEPTION_POINTERS into a snapshot
+//         struct, swallows the exception. Game continues; we get the
+//         crash address + registers in the next [Burst] log line.
+//   K=1:  conservative fallback (one worker at a time = vanilla concurrency).
 //
-// At K=1, this module is functionally equivalent to sync-offload with
-// the render-thread-only filter — every sub_CB7E80/CA2610 call on the
-// render thread runs on a pool worker instead, with the render thread
-// blocked on wait. Other threads (save, loader, etc.) passthrough so
-// no deadlocks.
-//
-// Real perf gain requires fixing the race on dword_1BAC080 — separate
-// work in our .injsec segment.
-constexpr int kBatchK = 1;
+// Restored to K=2 because we now have inner-SEH instrumentation: K=2 will
+// expose the race AND log the racy instruction's address without killing
+// the process. That's the data needed to write the .injsec replacement.
+constexpr int kBatchK = 2;
 
 constexpr uintptr_t kVA_CB7E80 = 0x00CB7E80;
 constexpr uintptr_t kVA_CA2610 = 0x00CA2610;
@@ -61,16 +58,71 @@ std::atomic<uint64_t> g_total{0};
 std::atomic<uint64_t> g_batched{0};
 std::atomic<uint64_t> g_drains{0};
 std::atomic<uint64_t> g_passthrough{0};
+std::atomic<uint64_t> g_workerExceptions{0};
 std::atomic<bool>     g_enabled{false};   // hooks inert until SetEnabled(true)
+
+// Captured once on the first worker exception inside RunOne — gives us the
+// crash address and registers even if no SetUnhandledExceptionFilter ever
+// fires (because some upstream SEH handler catches it, or because the
+// failure manifests as a hang instead of a fault). One snapshot is enough;
+// after that the counters keep ticking but we don't overwrite the first.
+struct ExceptionSnapshot {
+    DWORD    code;
+    DWORD    flags;
+    void*    address;
+    DWORD    eax, ebx, ecx, edx, esi, edi, ebp, esp, eip;
+    void*    thisPtr;
+    void*    arg;
+    DWORD    tid;
+};
+ExceptionSnapshot g_firstException = {};
+std::atomic<bool> g_firstExceptionCaptured{false};
 
 bool g_installed = false;
 std::chrono::steady_clock::time_point g_lastLog;
+
+// Inner exception filter: capture the EXCEPTION_POINTERS and store one
+// snapshot. Returns EXCEPTION_EXECUTE_HANDLER so the __except body runs
+// (which silently absorbs the exception, preventing process death).
+int CaptureWorkerException(EXCEPTION_POINTERS* info,
+                           const QueueEntry* e) {
+    g_workerExceptions.fetch_add(1, std::memory_order_relaxed);
+    bool expected = false;
+    if (g_firstExceptionCaptured.compare_exchange_strong(expected, true)) {
+        ExceptionSnapshot& s = g_firstException;
+        s.code    = info->ExceptionRecord->ExceptionCode;
+        s.flags   = info->ExceptionRecord->ExceptionFlags;
+        s.address = info->ExceptionRecord->ExceptionAddress;
+        s.eax = info->ContextRecord->Eax;
+        s.ebx = info->ContextRecord->Ebx;
+        s.ecx = info->ContextRecord->Ecx;
+        s.edx = info->ContextRecord->Edx;
+        s.esi = info->ContextRecord->Esi;
+        s.edi = info->ContextRecord->Edi;
+        s.ebp = info->ContextRecord->Ebp;
+        s.esp = info->ContextRecord->Esp;
+        s.eip = info->ContextRecord->Eip;
+        s.thisPtr = e->thisPtr;
+        s.arg     = e->arg;
+        s.tid     = GetCurrentThreadId();
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 void __cdecl RunOne(uint32_t i, void* userData) {
     auto* arr = static_cast<QueueEntry*>(userData);
     auto& e = arr[i];
     auto fn = reinterpret_cast<PFN_HotSub>(e.tramp);
-    fn(e.thisPtr, e.arg);
+    __try {
+        fn(e.thisPtr, e.arg);
+    } __except (CaptureWorkerException(GetExceptionInformation(), &e)) {
+        // Silently absorbed. Worker returns normally; ParallelFor's
+        // group counter ticks; render thread wakes from its wait. Game
+        // continues with whatever state corruption the partial sub_CB7E80
+        // left behind — likely visual glitch or downstream crash, but at
+        // least we've logged the exception address. Better than a silent
+        // hang.
+    }
 }
 
 void Drain() {
@@ -195,14 +247,33 @@ void MaybeLogStats() {
     g_lastLog = now;
 
     OD_LOG("[Burst] total=%llu batched=%llu drains=%llu passthrough=%llu "
-           "K=%d renderTid=%lu queueDepth=%d",
+           "exceptions=%llu K=%d renderTid=%lu queueDepth=%d",
            (unsigned long long)g_total.load(std::memory_order_relaxed),
            (unsigned long long)g_batched.load(std::memory_order_relaxed),
            (unsigned long long)g_drains.load(std::memory_order_relaxed),
            (unsigned long long)g_passthrough.load(std::memory_order_relaxed),
+           (unsigned long long)g_workerExceptions.load(std::memory_order_relaxed),
            kBatchK,
            (unsigned long)g_renderTid.load(std::memory_order_relaxed),
            g_queueN);
+
+    // If a worker has ever faulted, dump the first captured snapshot.
+    // Throttled by g_firstExceptionCaptured flag — we only have one slot
+    // and once filled it stays. (Subsequent exceptions still bump the
+    // counter, just don't overwrite the registers.)
+    if (g_firstExceptionCaptured.load(std::memory_order_acquire)) {
+        const ExceptionSnapshot& s = g_firstException;
+        OD_LOG("[Burst] FIRST WORKER EXCEPTION: code=0x%08lX addr=%p tid=%lu",
+               (unsigned long)s.code, s.address, (unsigned long)s.tid);
+        OD_LOG("[Burst]   EIP=0x%08lX ESP=0x%08lX EBP=0x%08lX",
+               (unsigned long)s.eip, (unsigned long)s.esp, (unsigned long)s.ebp);
+        OD_LOG("[Burst]   EAX=0x%08lX EBX=0x%08lX ECX=0x%08lX EDX=0x%08lX",
+               (unsigned long)s.eax, (unsigned long)s.ebx,
+               (unsigned long)s.ecx, (unsigned long)s.edx);
+        OD_LOG("[Burst]   ESI=0x%08lX EDI=0x%08lX  this=%p arg=%p",
+               (unsigned long)s.esi, (unsigned long)s.edi,
+               s.thisPtr, s.arg);
+    }
 }
 
 }  // namespace

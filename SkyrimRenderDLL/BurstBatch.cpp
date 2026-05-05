@@ -17,14 +17,23 @@ namespace {
 // so we declare hooks as __fastcall and let the compiler match the ABI.
 typedef void (__thiscall *PFN_HotSub)(void* thisPtr, void* arg);
 
-// Burst size. K=32 crashed the game on the first drain (2026-05-05) — true
-// concurrent execution of sub_CB7E80 raced on shared scratch state inside
-// the function. Reduced to K=2 for the diagnostic re-run: minimum possible
-// concurrency (only two workers in flight at any moment), so if the race
-// is rate-dependent it may run clean and let us ratchet up to find the
-// threshold. If it still crashes, CrashDebugger captures the racy
-// instruction's address and we know exactly where to fix.
-constexpr int kBatchK = 2;
+// Burst size. History (2026-05-05):
+//   K=32: crashed on first drain (true concurrency triggered the race).
+//   K=2:  crashed at the 30s burst-enable transition (race fires at any
+//         level of true concurrency on dword_1BAC080).
+//   K=1:  one worker active at a time; identical concurrency to vanilla,
+//         no race possible. ZERO perf gain (overhead exceeds work) but
+//         proves the dispatch path runs on workers without crashing.
+//
+// At K=1, this module is functionally equivalent to sync-offload with
+// the render-thread-only filter — every sub_CB7E80/CA2610 call on the
+// render thread runs on a pool worker instead, with the render thread
+// blocked on wait. Other threads (save, loader, etc.) passthrough so
+// no deadlocks.
+//
+// Real perf gain requires fixing the race on dword_1BAC080 — separate
+// work in our .injsec segment.
+constexpr int kBatchK = 1;
 
 constexpr uintptr_t kVA_CB7E80 = 0x00CB7E80;
 constexpr uintptr_t kVA_CA2610 = 0x00CA2610;

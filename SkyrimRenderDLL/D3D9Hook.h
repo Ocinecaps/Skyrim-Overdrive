@@ -63,4 +63,12 @@ bool TryGetLatestFrame(CapturedFrame& out, unsigned long long& inOutLastSeen);
 // Returns the number of NEW modules hooked on this call.
 int RescanAndHookNewD3d9Modules();
 
+// Walk every loaded d3d9 module's writable PE sections looking for static
+// pointers to real-IDirect3DDevice9 instances (ENB's real-device global).
+// Hooks any found via the same vtable bulk-hook + Mirror::Install path
+// applied to wrappers. Idempotent — safe to call repeatedly. Call once
+// after the rescan window completes (~30s post-Install). Returns the
+// number of real-device candidates hooked on this call.
+int ScanD3d9DataSectionsForRealDevice();
+
 }

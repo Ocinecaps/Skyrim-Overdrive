@@ -30,6 +30,14 @@ std::atomic<void*>              gRenderThreadHandle{nullptr};
 // scope.
 static void TryHookEmbeddedRealDevice(IDirect3DDevice9* wrapped);
 
+// Public: scan every loaded d3d9 module's writable PE sections for
+// aligned pointers that look like real-IDirect3DDevice9. ENB typically
+// stores its real-device handle as a static global in its own .data
+// section (one device per process). Call this once after the rescan
+// window completes (~30s post-Install) — by then ENB has fully
+// initialized and the real-d3d9 module has been picked up.
+int ScanD3d9DataSectionsForRealDevice();
+
 namespace {
 
 constexpr int kVtbl_IDirect3D9_CreateDevice         = 16;
@@ -490,9 +498,10 @@ bool Install() {
     // Build stamp — verify the right binary is loaded. Bumped on every change
     // to D3D9Hook so we can tell from the log whether the user picked up the
     // latest DLL after a rebuild.
-    OD_LOG("[D3D9] Build: 2026-05-05-c1aef14+intro (multi-module hook + "
-           "periodic rescan + ENB-wrapper introspection for real-device "
-           "vtable hooking).");
+    OD_LOG("[D3D9] Build: 2026-05-05-b822601+datascan (multi-module hook + "
+           "periodic rescan + ENB-wrapper introspection (0x400, indirect) + "
+           ".data-section scan of every d3d9 module for real-device "
+           "static globals — runs once at +30s).");
 
     EnumerateD3d9Modules();
 
@@ -714,7 +723,129 @@ void HookRealDeviceVtable(IDirect3DDevice9* realDev) {
     // own present chain (not by calling our HookedPresent on the real device).
 }
 
+// Returns the slot index of the d3d9 module whose memory range contains
+// `addr`, or -1 if `addr` is not in any known d3d9 module.
+int FindD3d9SlotByAddress(void* addr) {
+    if (!addr) return -1;
+    for (int i = 0; i < g_d3d9SlotCount; ++i) {
+        if (InModule(addr, g_d3d9Slots[i].module)) return i;
+    }
+    return -1;
+}
+
+// Case-insensitive substring check for "system32\d3d9.dll" — used to
+// distinguish the real (Windows-shipped) d3d9 from ENB's proxy (which
+// lives in the Skyrim install folder).
+bool IsRealD3d9Path(const char* path) {
+    if (!path) return false;
+    for (const char* p = path; *p; ++p) {
+        if ((p[0] | 0x20) == 's' && (p[1] | 0x20) == 'y' &&
+            (p[2] | 0x20) == 's' && (p[3] | 0x20) == 't' &&
+            (p[4] | 0x20) == 'e' && (p[5] | 0x20) == 'm' &&
+             p[6]         == '3' &&  p[7]         == '2') {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
+
+// =============================================================================
+// Public: data-section scanner
+// =============================================================================
+// Walks every loaded d3d9 module's writable, non-discardable PE sections and
+// scans 4-byte-aligned dwords for pointers that look like real-IDirect3DDevice9.
+// "Real" = its vtable lies in a d3d9 module whose path contains "system32\\".
+// This catches the standard ENB pattern: ENB's d3d9.dll stores a static
+// `g_realDevice` in its own .data section, then forwards Get/Set calls
+// through it bypassing our wrapper.
+//
+// Call once after the rescan window completes (~30s post-Install).
+int ScanD3d9DataSectionsForRealDevice() {
+    int hooked = 0;
+    int scanned = 0;
+
+    for (int slotIdx = 0; slotIdx < g_d3d9SlotCount; ++slotIdx) {
+        const D3D9HookSlot& slot = g_d3d9Slots[slotIdx];
+        if (!slot.module) continue;
+
+        const auto* dosHeader =
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(slot.module);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
+            reinterpret_cast<const uint8_t*>(dosHeader) + dosHeader->e_lfanew);
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) continue;
+
+        const auto* sections = IMAGE_FIRST_SECTION(ntHeaders);
+        const WORD numSections = ntHeaders->FileHeader.NumberOfSections;
+
+        for (WORD si = 0; si < numSections; ++si) {
+            const IMAGE_SECTION_HEADER& sec = sections[si];
+            if (!(sec.Characteristics & IMAGE_SCN_MEM_WRITE))      continue;
+            if   (sec.Characteristics & IMAGE_SCN_MEM_DISCARDABLE) continue;
+            if (sec.Misc.VirtualSize == 0) continue;
+
+            const uint8_t* secStart =
+                reinterpret_cast<const uint8_t*>(slot.module) + sec.VirtualAddress;
+            const uint32_t secSize = sec.Misc.VirtualSize;
+
+            char secName[9] = {};
+            memcpy(secName, sec.Name, 8);
+
+            int sectionHits = 0;
+            for (uint32_t off = 0; off + sizeof(void*) <= secSize;
+                 off += sizeof(void*)) {
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (!VirtualQuery(secStart + off, &mbi, sizeof(mbi))) break;
+                if (mbi.State != MEM_COMMIT) break;
+                ++scanned;
+
+                void* candidate =
+                    *reinterpret_cast<void* const*>(secStart + off);
+                if (!IsLikelyD3D9DevicePointer(candidate)) continue;
+
+                void* vt = *reinterpret_cast<void**>(candidate);
+                int vtSlot = FindD3d9SlotByAddress(vt);
+                if (vtSlot < 0) continue;
+
+                // Only hook devices whose vtable lives in the REAL d3d9
+                // (system32). Filters out wrappers (vtable in ENB's d3d9)
+                // and any self-references inside ENB's image.
+                if (!IsRealD3d9Path(g_d3d9Slots[vtSlot].path)) continue;
+
+                OD_LOG("[D3D9] data-scan: real-device candidate %p stored in "
+                       "slot[%d]=%s!.%s+0x%X (vtable=%p in slot[%d]=%s) — "
+                       "hooking.",
+                       candidate, slotIdx, slot.path, secName, off, vt,
+                       vtSlot, g_d3d9Slots[vtSlot].path);
+
+                HookRealDeviceVtable(reinterpret_cast<IDirect3DDevice9*>(candidate));
+                ++sectionHits;
+                ++hooked;
+            }
+
+            if (sectionHits > 0) {
+                OD_LOG("[D3D9] data-scan: slot[%d]=%s section .%s yielded "
+                       "%d real-device pointer(s)",
+                       slotIdx, slot.path, secName, sectionHits);
+            }
+        }
+    }
+
+    if (hooked == 0) {
+        OD_LOG("[D3D9] data-scan: scanned %d aligned dwords across all d3d9 "
+               "modules' writable sections; no real-device pointers found. "
+               "ENB may store the real device in TLS, a hash map, or behind "
+               "a getter (none of those are statics). Next: ENB getter "
+               "method introspection.", scanned);
+    } else {
+        OD_LOG("[D3D9] data-scan: hooked %d real-device(s) total. Mirror "
+               "shadow now intercepts ENB's internal reads — pipeline=true "
+               "should be glitch-free.", hooked);
+    }
+    return hooked;
+}
 
 static void TryHookEmbeddedRealDevice(IDirect3DDevice9* wrapped) {
     if (!wrapped) return;

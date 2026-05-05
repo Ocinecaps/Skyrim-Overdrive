@@ -169,6 +169,15 @@ void RunInstrumentationLoop() {
             if (sinceStart >= 30) {
                 rescanDone = true;
                 OD_LOG("[D3D9] rescan period (30s) complete — stopping module re-enumeration");
+                // Both ENB d3d9 and real-system32 d3d9 are now loaded and
+                // ENB has had >30s to fully initialize. Scan every d3d9
+                // module's writable sections for static pointers to real
+                // IDirect3DDevice9 instances (typical ENB layout: the
+                // real device is held in g_realDevice in ENB's .data).
+                // Wrapper introspection didn't find one inside the
+                // wrapper struct, so the real device must be elsewhere —
+                // a static global is the most likely storage.
+                overdrive::d3d9hook::ScanD3d9DataSectionsForRealDevice();
             }
         }
 
